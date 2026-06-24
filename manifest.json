@@ -1,0 +1,54 @@
+{
+  "id": "kia.notion",
+  "displayName": "Notion",
+  "version": "1.0.0",
+  "hostApi": "^2.0.0",
+  "entry": "dist/index.js",
+  "icon": "notion",
+  "permissions": ["db:read", "db:write", "net", "secrets"],
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "sources": [
+      {
+        "id": "notion",
+        "displayName": "Notion",
+        "icon": "notion",
+        "capabilities": {
+          "multiAccount": true,
+          "requiresAuth": true,
+          "supportsBackfill": true,
+          "supportsDelta": true,
+          "supportsRealtime": false
+        },
+        "inAddSource": true,
+        "pollable": true,
+        "submit": "notion-submit",
+        "steps": [
+          {
+            "type": "instruction",
+            "title": "Create an integration",
+            "body": "Create one, then copy the Internal Integration Secret.",
+            "link": "https://notion.so/my-integrations"
+          },
+          {
+            "type": "instruction",
+            "title": "Share pages",
+            "body": "In Notion, open each page/database → ••• → Connections → add it."
+          },
+          {
+            "type": "input-fields",
+            "validate": "notion-token",
+            "fields": [
+              {
+                "key": "token",
+                "label": "Internal secret",
+                "input": "password",
+                "placeholder": "ntn_…"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
