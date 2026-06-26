@@ -3,7 +3,7 @@ import type {
   Connector,
   ConnectorInstance,
   ConnectorHost,
-} from '@alpha-cent/connector-sdk';
+} from '@kiagent/connector-sdk';
 import { loadTokenBlob } from './safe-storage-blob';
 import { decodeNotionTokenFromStorage } from './token';
 import { NotionClient } from './client';

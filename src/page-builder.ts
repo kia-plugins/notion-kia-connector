@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { ConnectorHost, DocumentId } from '@alpha-cent/connector-sdk';
+import type { ConnectorHost, DocumentId } from '@kiagent/connector-sdk';
 import type { NotionClient } from './client';
 import type { NotionUserDirectory } from './users';
 import { renderBlocks } from './render';

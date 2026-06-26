@@ -1,4 +1,4 @@
-import type { ConnectorHost } from '@alpha-cent/connector-sdk';
+import type { ConnectorHost } from '@kiagent/connector-sdk';
 import type { NotionClient } from './client';
 import type { NotionUserDirectory } from './users';
 import { upsertPage } from './page-builder';

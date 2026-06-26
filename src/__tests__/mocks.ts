@@ -3,7 +3,7 @@ import type {
   DocumentId,
   PendingDocument,
   SyncStateRow,
-} from '@alpha-cent/connector-sdk';
+} from '@kiagent/connector-sdk';
 import type { NotionClient } from '../client';
 import type { BlockNode, NotionPage, SearchResult } from '../types';
 
