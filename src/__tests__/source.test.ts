@@ -12,7 +12,7 @@
  * cursor/batching/floor logic.
  */
 import { createNotionSource, type NotionCursor, type NotionItem } from '../source';
-import type { NetFetch } from '../client';
+import { NotionApiError, type NetFetch } from '../client';
 import type { NotionSearchResult } from '../notion-types';
 import type {
   Account,
@@ -153,6 +153,25 @@ describe('connect', () => {
 
     expect(result.identifier).toBe('Solo Bot');
   });
+
+  it('propagates a non-2xx failure from GET /users/me (e.g. 401) to the caller', async () => {
+    const { fetchFn, calls } = scriptedFetch([
+      jsonResponse(401, { code: 'unauthorized', message: 'API token is invalid.' }),
+    ]);
+    const source = createNotionSource(makeHost(fetchFn));
+    const { auth } = makeAuth({ password: 'secret_deadbeef' });
+
+    let error: unknown;
+    try {
+      await source.connect(auth);
+    } catch (e) {
+      error = e;
+    }
+
+    expect(error).toBeInstanceOf(NotionApiError);
+    expect((error as NotionApiError).httpStatus).toBe(401);
+    expect(calls).toHaveLength(1);
+  });
 });
 
 describe('pull — backfill', () => {
@@ -269,6 +288,90 @@ describe('pull — delta', () => {
 
     expect(batches).toHaveLength(0);
   });
+
+  it('folds the scan ceiling into the (single, final) slice cursor when the newest scanned item is skipped (archived) and never ingested', async () => {
+    const L0 = '2024-04-01T00:10:00.000Z'; // floor = 00:09:00.000Z
+    const skippedNewest = page('skippedNewest', '2024-04-01T00:20:00.000Z', { archived: true });
+    const p1 = page('p1', '2024-04-01T00:15:00.000Z');
+    const p2 = page('p2', '2024-04-01T00:12:00.000Z');
+    const tail = page('tail', '2024-04-01T00:08:00.000Z'); // at/before the floor — stops paging
+
+    const { fetchFn, calls } = scriptedFetch([
+      jsonResponse(200, {
+        results: [skippedNewest, p1, p2, tail],
+        has_more: true,
+        next_cursor: 'd2',
+      }),
+      emptyBlocks(), // p2 blocks (oldest-first)
+      emptyBlocks(), // p1 blocks
+    ]);
+    const source = createNotionSource(makeHost(fetchFn));
+    const session = makeSession({ password: 'secret_x' });
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, { lastEditedTime: L0 })) batches.push(b);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].items.map((i) => i.page.id)).toEqual(['p2', 'p1']);
+    // the scan ceiling (skippedNewest's time) folds into the final slice's cursor...
+    expect(batches[0].cursor).toEqual({ lastEditedTime: skippedNewest.last_edited_time });
+    // ...even though the skipped item itself is never ingested.
+    expect(batches[0].items.some((i) => i.page.id === 'skippedNewest')).toBe(false);
+
+    // only one search page requested — the floor break stopped paging before page 2.
+    expect(calls.filter((c) => c.url.endsWith('/search'))).toHaveLength(1);
+  });
+
+  it('slices >20 collected pages into oldest-first batches whose cursors only ever cover what that slice (and earlier ones) fully ingested, folding the scan ceiling only into the final slice', async () => {
+    // 26 real network calls (1 search + 25 block fetches), each throttled to the
+    // client's real ~334ms (3 rps) interval since source.ts's client uses the
+    // default (real) sleep/now — comfortably exceeds Jest's 5s default timeout.
+    const L0 = '2024-05-01T01:00:00.000Z'; // floor = 2024-05-01T00:59:00.000Z
+    const skippedNewest = page('skippedNewest', '2024-05-01T02:00:00.000Z', { archived: true });
+    // 25 real pages, descending: page1 newest .. page25 oldest (all still above the floor).
+    const pages = Array.from({ length: 25 }, (_, idx) => {
+      const k = idx + 1;
+      const t = new Date(Date.parse(L0) + (26 - k) * 60_000).toISOString();
+      return page(`page${k}`, t);
+    });
+
+    const { fetchFn, calls } = scriptedFetch([
+      jsonResponse(200, {
+        results: [skippedNewest, ...pages],
+        has_more: false,
+        next_cursor: null,
+      }),
+      ...Array.from({ length: 25 }, () => emptyBlocks()),
+    ]);
+    const source = createNotionSource(makeHost(fetchFn));
+    const session = makeSession({ password: 'secret_x' });
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, { lastEditedTime: L0 })) batches.push(b);
+
+    expect(batches).toHaveLength(2);
+
+    // first (intermediate) batch: the 20 oldest, oldest-first (page25 .. page6).
+    const expectedFirstIds = Array.from({ length: 20 }, (_, i) => `page${25 - i}`);
+    expect(batches[0].items.map((i) => i.page.id)).toEqual(expectedFirstIds);
+    // its cursor covers only the newest page WITHIN this slice (page6 = pages[5]) —
+    // it does not jump ahead to slice 2's pages or to the global scan ceiling.
+    expect(batches[0].cursor).toEqual({ lastEditedTime: pages[5].last_edited_time });
+    expect(batches[0].cursor.lastEditedTime).not.toBe(skippedNewest.last_edited_time);
+
+    // final batch: the remaining 5 newest, oldest-first (page5 .. page1).
+    const expectedSecondIds = Array.from({ length: 5 }, (_, i) => `page${5 - i}`);
+    expect(batches[1].items.map((i) => i.page.id)).toEqual(expectedSecondIds);
+    // every real page is now ingested, so the final slice folds in the scan ceiling.
+    expect(batches[1].cursor).toEqual({ lastEditedTime: skippedNewest.last_edited_time });
+
+    // the skipped item is never ingested, across either batch.
+    const allIds = [...batches[0].items, ...batches[1].items].map((i) => i.page.id);
+    expect(allIds).toHaveLength(25);
+    expect(allIds).not.toContain('skippedNewest');
+
+    expect(calls.filter((c) => c.url.endsWith('/search'))).toHaveLength(1);
+  }, 20_000);
 });
 
 describe('pull — missing credentials', () => {
