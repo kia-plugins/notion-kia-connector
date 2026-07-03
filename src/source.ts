@@ -142,7 +142,18 @@ async function* delta(
     }
   }
 
-  if (collected.length === 0) return; // nothing new
+  if (collected.length === 0) {
+    // Trash-only/database-only window: no real page to ingest, but the scan
+    // ceiling still advanced past the incoming floor — yield one empty batch
+    // so the cursor advances too (v1 did this; otherwise every 30-minute
+    // cadence re-scans an ever-widening window forever). If nothing was
+    // scanned above the floor at all, scanMax === startEdited and there is
+    // truly nothing new — return without yielding, as before.
+    if (scanMax > startEdited) {
+      yield { phase: 'live', items: [], cursor: { lastEditedTime: scanMax } };
+    }
+    return;
+  }
 
   collected.reverse(); // oldest-first: the cursor only ever advances forward
 

@@ -117,6 +117,33 @@ describe('NotionClient', () => {
     expect(fetchFn).toHaveBeenCalledTimes(6);
   });
 
+  it('retries a thrown network error (e.g. ECONNRESET) once then succeeds, sharing the transient backoff', async () => {
+    let call = 0;
+    const fetchFn = jest.fn(async () => {
+      call += 1;
+      if (call === 1) throw new Error('ECONNRESET');
+      return jsonResponse(200, { done: true });
+    });
+    const { client, sleeps } = makeClient(fetchFn);
+
+    const result = await client.request('GET', '/search');
+
+    expect(result).toEqual({ done: true });
+    expect(sleeps).toEqual([1000]);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives up after repeated thrown network errors, backing off 1000/2000/4000/8000ms', async () => {
+    const fetchFn = jest.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const { client, sleeps } = makeClient(fetchFn);
+
+    await expect(client.request('GET', '/search')).rejects.toThrow(/network error after 5 attempts/);
+    expect(sleeps).toEqual([1000, 2000, 4000, 8000]);
+    expect(fetchFn).toHaveBeenCalledTimes(5);
+  });
+
   it('backs off 1000/2000/4000/8000ms on repeated 500s, then throws', async () => {
     const fetchFn = jest.fn(async () => jsonResponse(500, {}));
     const { client, sleeps } = makeClient(fetchFn);

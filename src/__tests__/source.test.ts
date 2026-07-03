@@ -293,6 +293,37 @@ describe('pull — delta', () => {
     expect(batches).toHaveLength(0);
   });
 
+  it('advances the cursor to the scan ceiling on a trash-only window, so a burst of archived/trashed/database activity cannot stall the cursor forever', async () => {
+    const L0 = '2024-06-01T00:10:00.000Z'; // floor = 00:09:00.000Z
+    const archivedNewest = page('archived1', '2024-06-01T00:20:00.000Z', { archived: true });
+    const trashedPage = page('trashed1', '2024-06-01T00:15:00.000Z', { in_trash: true });
+    const dbItem = page('db1', '2024-06-01T00:12:00.000Z', { object: 'database' });
+    const tail = page('tail', '2024-06-01T00:08:00.000Z'); // at/before the floor — stops paging
+
+    const { fetchFn, calls } = scriptedFetch([
+      jsonResponse(200, {
+        results: [archivedNewest, trashedPage, dbItem, tail],
+        has_more: true,
+        next_cursor: 'never-requested',
+      }),
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const session = makeSession({ password: 'secret_x' });
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, { lastEditedTime: L0 })) batches.push(b);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toEqual({
+      phase: 'live',
+      items: [],
+      cursor: { lastEditedTime: archivedNewest.last_edited_time },
+    });
+
+    // Paging stopped at the floor break — the (never-requested) second page is absent.
+    expect(calls.filter((c) => c.url.endsWith('/search'))).toHaveLength(1);
+  });
+
   it('folds the scan ceiling into the (single, final) slice cursor when the newest scanned item is skipped (archived) and never ingested', async () => {
     const L0 = '2024-04-01T00:10:00.000Z'; // floor = 00:09:00.000Z
     const skippedNewest = page('skippedNewest', '2024-04-01T00:20:00.000Z', { archived: true });
