@@ -46,7 +46,7 @@ interface NotionPageEnvelope<T> {
   next_cursor?: string | null;
 }
 
-/** code=401 makes the scheduler's isAuthError() flag the account needs_reauth. */
+/** Carries Notion's error code string and the HTTP status for callers to branch on. */
 export class NotionApiError extends Error {
   constructor(
     public notionCode: string,
