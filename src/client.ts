@@ -1,4 +1,26 @@
-import { setTimeout as nodeSleep } from 'node:timers/promises';
+/**
+ * v2 port of v1 `src/client.ts` (see `git show main:src/client.ts` in this
+ * repo). Preserved verbatim: API base, notion-version header, the 3-rps
+ * throttle, 429 handling (retry-after clamp, ≤5 retries), transient
+ * network/5xx exponential backoff (1s × 2^n, ≤4 retries), NotionApiError with
+ * 401 pass-through, and both paginators.
+ *
+ * Deltas from v1:
+ *  1. All I/O goes through `deps.fetch` — the host's `net.fetch` surface —
+ *     NEVER the global fetch. v1 called `fetchFn ?? fetch` directly against a
+ *     Web Response; here the host resolves to a plain object (status /
+ *     statusText / headers (lowercase keys) / body: Uint8Array), so responses
+ *     are parsed manually (JSON.parse(new TextDecoder().decode(body))) and
+ *     there is no `.ok` — computed from `status`.
+ *  2. Token is a constructor dep (one client instance per pull — see Task 13),
+ *     sent as `authorization: Bearer ${token}` — v1 read it via getToken().
+ *  3. `sleep`/`now` are injectable (default: real timer / Date.now) so tests
+ *     never actually wait — v1 had the same seam (sleepFn/nowFn).
+ *  4. Dropped: users directory, safeStorage/token-blob code, `db` access —
+ *     v2's client is fetch-only.
+ */
+
+export type NetFetch = (url: string, init?: unknown) => Promise<unknown>;
 
 export const NOTION_API_BASE = 'https://api.notion.com/v1';
 export const NOTION_VERSION = '2022-06-28';
@@ -9,26 +31,13 @@ const MAX_TRANSIENT_RETRIES = 4;
 const TRANSIENT_BACKOFF_MS = 1_000; // 1s, 2s, 4s, 8s
 const MAX_RATE_LIMIT_RETRIES = 5;
 
-/** code=401 makes the scheduler's isAuthError() flag the account needs_reauth. */
-export class NotionApiError extends Error {
-  readonly code?: number;
-
-  constructor(
-    readonly notionCode: string,
-    readonly httpStatus: number,
-    message: string,
-  ) {
-    super(`notion ${notionCode}: ${message}`);
-    this.name = 'NotionApiError';
-    if (httpStatus === 401) this.code = 401;
-  }
-}
-
-export interface NotionClientDeps {
-  getToken: () => string;
-  fetchFn?: typeof fetch;
-  sleepFn?: (ms: number) => Promise<void>;
-  nowFn?: () => number;
+/** The host `net.fetch` surface resolves to this shape — header keys are
+ *  lowercase (built via Object.fromEntries(res.headers.entries())). */
+interface HostResponse {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: Uint8Array;
 }
 
 interface NotionPageEnvelope<T> {
@@ -37,21 +46,41 @@ interface NotionPageEnvelope<T> {
   next_cursor?: string | null;
 }
 
+/** Carries Notion's error code string and the HTTP status for callers to branch on. */
+export class NotionApiError extends Error {
+  constructor(
+    public notionCode: string,
+    public httpStatus: number,
+    message: string,
+  ) {
+    super(`notion ${notionCode}: ${message}`);
+    this.name = 'NotionApiError';
+  }
+}
+
+export interface NotionClientDeps {
+  fetch: NetFetch;
+  token: string;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
 export class NotionClient {
   requestCount = 0;
 
   private lastCallAt = 0;
 
-  private readonly fetchFn: typeof fetch;
+  private readonly fetchFn: NetFetch;
 
   private readonly sleepFn: (ms: number) => Promise<void>;
 
   private readonly now: () => number;
 
   constructor(private readonly deps: NotionClientDeps) {
-    this.fetchFn = deps.fetchFn ?? fetch;
-    this.sleepFn = deps.sleepFn ?? (async (ms) => void (await nodeSleep(ms)));
-    this.now = deps.nowFn ?? Date.now;
+    this.fetchFn = deps.fetch;
+    this.sleepFn =
+      deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.now = deps.now ?? Date.now;
   }
 
   private async throttle(): Promise<void> {
@@ -64,24 +93,24 @@ export class NotionClient {
   async request<T = unknown>(
     method: 'GET' | 'POST',
     pathname: string,
-    body?: Record<string, unknown>,
+    body?: unknown,
   ): Promise<T> {
     let transient = 0;
     let rateLimited = 0;
     for (;;) {
       await this.throttle();
-      let res: Awaited<ReturnType<typeof fetch>>;
+      let res: HostResponse;
       try {
         // eslint-disable-next-line no-await-in-loop
-        res = await this.fetchFn(`${NOTION_API_BASE}${pathname}`, {
+        res = (await this.fetchFn(`${NOTION_API_BASE}${pathname}`, {
           method,
           headers: {
-            authorization: `Bearer ${this.deps.getToken()}`,
+            authorization: `Bearer ${this.deps.token}`,
             'notion-version': NOTION_VERSION,
             'content-type': 'application/json',
           },
           body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
-        });
+        })) as HostResponse;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (transient >= MAX_TRANSIENT_RETRIES)
@@ -99,9 +128,9 @@ export class NotionClient {
             `notion ${pathname}: HTTP 429 after ${rateLimited + 1} attempts`,
           );
         rateLimited += 1;
-        // Retry-After may be missing or a non-numeric HTTP-date; both must not
-        // collapse to a 0ms busy-retry. Default to 5s, floor 1s, cap 60s.
-        const raw = Number(res.headers.get('retry-after'));
+        // retry-after may be missing or non-numeric; both must not collapse
+        // to a 0ms busy-retry. Default to 5s, floor 1s, cap 60s.
+        const raw = Number(res.headers['retry-after']);
         const after = Number.isFinite(raw) ? Math.min(Math.max(1, raw), 60) : 5;
         // eslint-disable-next-line no-await-in-loop
         await this.sleepFn(after * 1000);
@@ -117,12 +146,12 @@ export class NotionClient {
         await this.sleepFn(TRANSIENT_BACKOFF_MS * 2 ** (transient - 1));
         continue;
       }
-      // eslint-disable-next-line no-await-in-loop
-      const json = (await res.json()) as T & {
+      const json = JSON.parse(new TextDecoder().decode(res.body)) as T & {
         code?: string;
         message?: string;
       };
-      if (!res.ok)
+      const ok = res.status >= 200 && res.status < 300;
+      if (!ok)
         throw new NotionApiError(
           json.code ?? 'unknown_error',
           res.status,

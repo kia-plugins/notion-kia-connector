@@ -1,18 +1,17 @@
-import type { BlockNode, NotionRichText } from './types';
+/**
+ * v2 port of v1 `src/render.ts` (see `git show main:src/render.ts` in this
+ * repo) — near-verbatim. ONE delta: v1's `@mention` user resolution (an
+ * injected `resolve` callback) is dropped; mention spans render their
+ * `plain_text` directly, so `renderRichText`/`renderBlock`/`renderBlocks` no
+ * longer take a resolver argument.
+ */
+import type { NotionBlock, NotionRichText } from './notion-types';
 
-type Resolve = (id?: string) => string;
-
-export function renderRichText(
-  rts: NotionRichText[] | undefined,
-  resolve: Resolve,
-): string {
+export function renderRichText(rts: NotionRichText[] | undefined): string {
   if (!rts?.length) return '';
   return rts
     .map((r) => {
       let text = r.plain_text;
-      if (!text && r.type === 'mention' && r.mention?.type === 'user') {
-        text = `@${resolve(r.mention.user?.id)}`;
-      }
       const a = r.annotations ?? {};
       if (a.code) text = `\`${text}\``;
       if (a.bold) text = `**${text}**`;
@@ -24,7 +23,7 @@ export function renderRichText(
     .join('');
 }
 
-function rtOf(block: BlockNode): NotionRichText[] | undefined {
+function rtOf(block: NotionBlock): NotionRichText[] | undefined {
   const payload = block[block.type] as
     | { rich_text?: NotionRichText[] }
     | undefined;
@@ -32,9 +31,9 @@ function rtOf(block: BlockNode): NotionRichText[] | undefined {
 }
 
 /** Render one block to markdown (without its children). Returns null to skip. */
-function renderBlock(block: BlockNode, resolve: Resolve): string | null {
+function renderBlock(block: NotionBlock): string | null {
   const t = block.type;
-  const text = renderRichText(rtOf(block), resolve);
+  const text = renderRichText(rtOf(block));
   switch (t) {
     case 'paragraph':
       return text;
@@ -96,7 +95,7 @@ function renderBlock(block: BlockNode, resolve: Resolve): string | null {
           }
         | undefined;
       const url = media?.external?.url ?? media?.file?.url ?? '';
-      const caption = renderRichText(media?.caption, resolve) || t;
+      const caption = renderRichText(media?.caption) || t;
       return url ? `[${caption}](${url})` : null;
     }
     case 'equation': {
@@ -109,7 +108,7 @@ function renderBlock(block: BlockNode, resolve: Resolve): string | null {
       const cells = (
         (block.table_row as { cells?: NotionRichText[][] } | undefined)
           ?.cells ?? []
-      ).map((c) => renderRichText(c, resolve));
+      ).map((c) => renderRichText(c));
       return `| ${cells.join(' | ')} |`;
     }
     // Containers with no text of their own: emit nothing, let children render.
@@ -135,14 +134,14 @@ const indent = (s: string, pad: string) =>
  * per-block recursion (blank-line joins, depth indentation) cannot express that,
  * so the `table` block renders its own `table_row` children here.
  */
-function renderTable(block: BlockNode, resolve: Resolve): string {
+function renderTable(block: NotionBlock): string {
   const rows = (block.children ?? []).filter((c) => c.type === 'table_row');
   if (!rows.length) return '';
-  const renderRow = (r: BlockNode): string =>
+  const renderRow = (r: NotionBlock): string =>
     `| ${(
       (r.table_row as { cells?: NotionRichText[][] } | undefined)?.cells ?? []
     )
-      .map((c) => renderRichText(c, resolve))
+      .map((c) => renderRichText(c))
       .join(' | ')} |`;
   const colCount = (
     (rows[0].table_row as { cells?: NotionRichText[][] } | undefined)?.cells ??
@@ -153,23 +152,19 @@ function renderTable(block: BlockNode, resolve: Resolve): string {
   return [lines[0], separator, ...lines.slice(1)].join('\n');
 }
 
-export function renderBlocks(
-  blocks: BlockNode[],
-  resolve: Resolve,
-  depth = 0,
-): string {
+export function renderBlocks(blocks: NotionBlock[], depth = 0): string {
   const out: string[] = [];
   for (const block of blocks) {
     // Tables render as one contiguous GFM block (header + delimiter + rows);
     // the generic recursion below can't, so handle + skip their children here.
     if (block.type === 'table' && block.children?.length) {
-      const tableMd = renderTable(block, resolve);
+      const tableMd = renderTable(block);
       if (tableMd)
         out.push(depth > 0 ? indent(tableMd, '  '.repeat(depth)) : tableMd);
       continue;
     }
 
-    const rendered = renderBlock(block, resolve);
+    const rendered = renderBlock(block);
     if (rendered)
       out.push(depth > 0 ? indent(rendered, '  '.repeat(depth)) : rendered);
     if (block.children?.length) {
@@ -177,7 +172,7 @@ export function renderBlocks(
       // synced_block → '') is "flattened": its children stay at the current
       // depth rather than being indented one level deeper.
       const childDepth = rendered === '' ? depth : depth + 1;
-      const childMd = renderBlocks(block.children, resolve, childDepth);
+      const childMd = renderBlocks(block.children, childDepth);
       if (childMd) out.push(childMd);
     }
   }
