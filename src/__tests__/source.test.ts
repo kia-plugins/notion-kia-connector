@@ -112,10 +112,14 @@ function page(
 
 const emptyBlocks = () => jsonResponse(200, { results: [], has_more: false, next_cursor: null });
 
+// Instant clock via createNotionSource's test seam: the client's 3 rps
+// throttle resolves immediately instead of really sleeping.
+const instantClock = { sleep: async () => {} };
+
 describe('connect', () => {
   it('prompts with a password field (format: password) and rejects a bad token before any fetch', async () => {
     const { fetchFn, calls } = scriptedFetch([]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const { auth, getSchema } = makeAuth({ password: 'not-a-real-token' });
 
     await expect(source.connect(auth)).rejects.toThrow(/does not look like a Notion/);
@@ -133,7 +137,7 @@ describe('connect', () => {
     const { fetchFn, calls } = scriptedFetch([
       jsonResponse(200, { bot: { workspace_name: 'Acme Corp' } }),
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const { auth } = makeAuth({ password: '  secret_abc123  ' });
 
     const result = await source.connect(auth);
@@ -146,7 +150,7 @@ describe('connect', () => {
 
   it('falls back to the user name, then "notion", when no workspace name is present', async () => {
     const { fetchFn } = scriptedFetch([jsonResponse(200, { name: 'Solo Bot' })]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const { auth } = makeAuth({ password: 'ntn_zzz' });
 
     const result = await source.connect(auth);
@@ -158,7 +162,7 @@ describe('connect', () => {
     const { fetchFn, calls } = scriptedFetch([
       jsonResponse(401, { code: 'unauthorized', message: 'API token is invalid.' }),
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const { auth } = makeAuth({ password: 'secret_deadbeef' });
 
     let error: unknown;
@@ -195,7 +199,7 @@ describe('pull — backfill', () => {
       jsonResponse(200, { results: [p4, p5], has_more: false, next_cursor: null }),
       emptyBlocks(), // p5 blocks
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -227,7 +231,7 @@ describe('pull — backfill', () => {
       jsonResponse(200, { results: [p9], has_more: false, next_cursor: null }),
       emptyBlocks(), // p9 blocks
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -258,7 +262,7 @@ describe('pull — delta', () => {
       emptyBlocks(), // newA2 blocks
       emptyBlocks(), // newA1 blocks
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -280,7 +284,7 @@ describe('pull — delta', () => {
     const { fetchFn } = scriptedFetch([
       jsonResponse(200, { results: [old], has_more: true, next_cursor: 'z2' }),
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -305,7 +309,7 @@ describe('pull — delta', () => {
       emptyBlocks(), // p2 blocks (oldest-first)
       emptyBlocks(), // p1 blocks
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -323,9 +327,6 @@ describe('pull — delta', () => {
   });
 
   it('slices >20 collected pages into oldest-first batches whose cursors only ever cover what that slice (and earlier ones) fully ingested, folding the scan ceiling only into the final slice', async () => {
-    // 26 real network calls (1 search + 25 block fetches), each throttled to the
-    // client's real ~334ms (3 rps) interval since source.ts's client uses the
-    // default (real) sleep/now — comfortably exceeds Jest's 5s default timeout.
     const L0 = '2024-05-01T01:00:00.000Z'; // floor = 2024-05-01T00:59:00.000Z
     const skippedNewest = page('skippedNewest', '2024-05-01T02:00:00.000Z', { archived: true });
     // 25 real pages, descending: page1 newest .. page25 oldest (all still above the floor).
@@ -343,7 +344,7 @@ describe('pull — delta', () => {
       }),
       ...Array.from({ length: 25 }, () => emptyBlocks()),
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
@@ -371,13 +372,13 @@ describe('pull — delta', () => {
     expect(allIds).not.toContain('skippedNewest');
 
     expect(calls.filter((c) => c.url.endsWith('/search'))).toHaveLength(1);
-  }, 20_000);
+  });
 });
 
 describe('pull — missing credentials', () => {
   it('throws telling the user to reconnect the account, before any fetch', async () => {
     const { fetchFn, calls } = scriptedFetch([]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession(null);
 
     await expect(
@@ -400,7 +401,7 @@ describe('reconcile', () => {
     const { fetchFn } = scriptedFetch([
       jsonResponse(200, { results: [a, b, c], has_more: false, next_cursor: null }),
     ]);
-    const source = createNotionSource(makeHost(fetchFn));
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
 
     const refs: ExternalRef[] = [];

@@ -9,7 +9,7 @@
  * governs backfill only; Task 14 updates the spec text.
  */
 import type { AuthChannel, Batch, HostFor, Session, Source } from './kiagent-contracts';
-import { NotionClient } from './client';
+import { NotionClient, type NotionClientDeps } from './client';
 import type { NotionSearchResult } from './notion-types';
 import { buildMarkdown, fetchBlockTree, pageTitle } from './pages';
 
@@ -162,7 +162,12 @@ async function* delta(
   }
 }
 
-export function createNotionSource(host: HostFor<'net'>): Source<NotionCursor, NotionItem> {
+export function createNotionSource(
+  host: HostFor<'net'>,
+  // Test seam only: NotionClient's sleep/now are injectable so tests never
+  // actually wait out the 3 rps throttle; production callers omit this.
+  clock?: Pick<NotionClientDeps, 'sleep' | 'now'>,
+): Source<NotionCursor, NotionItem> {
   return {
     descriptor: {
       id: 'notion',
@@ -186,7 +191,7 @@ export function createNotionSource(host: HostFor<'net'>): Source<NotionCursor, N
           'that does not look like a Notion internal integration secret (ntn_… or secret_…)',
         );
       }
-      const client = new NotionClient({ fetch: host.net.fetch, token });
+      const client = new NotionClient({ fetch: host.net.fetch, token, ...clock });
       const me = await client.request<{ name?: string; bot?: { workspace_name?: string } }>(
         'GET',
         '/users/me',
@@ -196,7 +201,7 @@ export function createNotionSource(host: HostFor<'net'>): Source<NotionCursor, N
 
     async *pull(session: Session, cursor: NotionCursor | null) {
       const token = await requireToken(session);
-      const client = new NotionClient({ fetch: host.net.fetch, token });
+      const client = new NotionClient({ fetch: host.net.fetch, token, ...clock });
       if (cursor === null || cursor.lastEditedTime === null || cursor.nextCursor) {
         yield* backfill(client, session, cursor);
       } else {
@@ -222,7 +227,7 @@ export function createNotionSource(host: HostFor<'net'>): Source<NotionCursor, N
 
     async *reconcile(session: Session) {
       const token = await requireToken(session);
-      const client = new NotionClient({ fetch: host.net.fetch, token });
+      const client = new NotionClient({ fetch: host.net.fetch, token, ...clock });
       for await (const results of client.paginate<NotionSearchResult>('/search', {
         filter: { property: 'object', value: 'page' },
         page_size: 100,
