@@ -1,6 +1,6 @@
 {
   "name": "notion-kia-connector",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "private": true,
   "description": "Notion connector for KIAgent (new extension platform)",
   "files": [

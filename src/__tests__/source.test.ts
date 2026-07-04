@@ -184,6 +184,10 @@ describe('pull — backfill', () => {
   const T3 = '2024-01-01T00:02:00.000Z';
   const T4 = '2024-01-01T00:03:00.000Z';
   const T5 = '2024-01-01T00:04:00.000Z';
+  const T6 = '2024-01-01T00:05:00.000Z';
+
+  const emptyDbList = () =>
+    jsonResponse(200, { results: [], has_more: false, next_cursor: null });
 
   it('hand-pages ascending, skips archived/in_trash, tracks the cursor high-water mark, then flips to live', async () => {
     const p1 = page('p1', T1);
@@ -198,6 +202,7 @@ describe('pull — backfill', () => {
       emptyBlocks(), // p3 blocks
       jsonResponse(200, { results: [p4, p5], has_more: false, next_cursor: null }),
       emptyBlocks(), // p5 blocks
+      emptyDbList(), // database discovery: none
     ]);
     const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
@@ -205,7 +210,7 @@ describe('pull — backfill', () => {
     const batches: Array<Batch<NotionCursor, NotionItem>> = [];
     for await (const b of source.pull(session, null)) batches.push(b);
 
-    expect(batches).toHaveLength(3);
+    expect(batches).toHaveLength(4);
 
     expect(batches[0].phase).toBe('backfill');
     expect(batches[0].items.map((i) => i.page.id)).toEqual(['p1', 'p3']);
@@ -213,15 +218,26 @@ describe('pull — backfill', () => {
 
     expect(batches[1].phase).toBe('backfill');
     expect(batches[1].items.map((i) => i.page.id)).toEqual(['p5']);
-    expect(batches[1].cursor).toEqual({ lastEditedTime: T5, nextCursor: undefined });
+    expect(batches[1].cursor).toEqual({ lastEditedTime: T5, phase: 'dblist' });
 
-    expect(batches[2]).toEqual({ phase: 'live', items: [], cursor: { lastEditedTime: T5 } });
+    // database discovery found nothing → empty dbsweep hand-off batch
+    expect(batches[2]).toEqual({
+      phase: 'backfill',
+      items: [],
+      cursor: { lastEditedTime: T5, phase: 'dbsweep', dbQueue: [] },
+    });
+
+    expect(batches[3]).toEqual({ phase: 'live', items: [], cursor: { lastEditedTime: T5 } });
 
     const searchCalls = calls.filter((c) => c.url.endsWith('/search'));
     expect(searchCalls.map((c) => (c.body as { start_cursor?: string }).start_cursor)).toEqual([
       undefined,
       'cursor-2',
+      undefined, // database-discovery search
     ]);
+    expect(
+      (searchCalls[2].body as { filter: { value: string } }).filter.value,
+    ).toBe('database');
     expect(calls.filter((c) => c.url.includes('/blocks/'))).toHaveLength(3);
   });
 
@@ -230,6 +246,7 @@ describe('pull — backfill', () => {
     const { fetchFn, calls } = scriptedFetch([
       jsonResponse(200, { results: [p9], has_more: false, next_cursor: null }),
       emptyBlocks(), // p9 blocks
+      emptyDbList(),
     ]);
     const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
@@ -241,9 +258,170 @@ describe('pull — backfill', () => {
 
     const searchCall = calls.find((c) => c.url.endsWith('/search'));
     expect((searchCall?.body as { start_cursor?: string }).start_cursor).toBe('resume-here');
-    // one backfill batch (has_more already false) + the live flip
-    expect(batches).toHaveLength(2);
+    // one backfill batch (has_more already false) + dbsweep hand-off + live flip
+    expect(batches).toHaveLength(3);
     expect(batches[0].items.map((i) => i.page.id)).toEqual(['p9']);
+  });
+
+  it('sweeps every discovered database\'s rows after the page walk (v1 parity: the search index misses database rows), deduping rows already ingested this run', async () => {
+    const p1 = page('p1', T1);
+    const row1 = page('row1', T4, { parent: { type: 'database_id' } });
+    const row2 = page('row2', T6, { parent: { type: 'database_id' } });
+
+    const { fetchFn, calls } = scriptedFetch([
+      // pages phase: p1 AND row1 (search saw one row but not the other)
+      jsonResponse(200, { results: [p1, row1], has_more: false, next_cursor: null }),
+      emptyBlocks(), // p1 blocks
+      emptyBlocks(), // row1 blocks
+      // database discovery: two dbs, one archived (skipped)
+      jsonResponse(200, {
+        results: [
+          page('db1', T1, { object: 'database' }),
+          page('dbX', T1, { object: 'database', archived: true }),
+        ],
+        has_more: false,
+        next_cursor: null,
+      }),
+      // db1 rows: row1 (already ingested — deduped) + row2 (search missed it)
+      jsonResponse(200, { results: [row1, row2], has_more: false, next_cursor: null }),
+      emptyBlocks(), // row2 blocks only — row1 must NOT be re-fetched
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const session = makeSession({ password: 'secret_x' });
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, null)) batches.push(b);
+
+    // [pages batch, dbsweep hand-off, db1 sweep batch, live flip]
+    expect(batches).toHaveLength(4);
+    // dbsweep hand-off carries the surviving db queue
+    expect(batches[1].cursor).toEqual({
+      lastEditedTime: T4,
+      phase: 'dbsweep',
+      dbQueue: ['db1'],
+    });
+    // sweep batch: row2 only (row1 deduped), db1 popped from the queue
+    expect(batches[2].items.map((i) => i.page.id)).toEqual(['row2']);
+    expect(batches[2].cursor).toEqual({
+      lastEditedTime: T6,
+      phase: 'dbsweep',
+      dbQueue: [],
+    });
+    expect(batches[3]).toEqual({ phase: 'live', items: [], cursor: { lastEditedTime: T6 } });
+
+    const queryCalls = calls.filter((c) => c.url.includes('/databases/'));
+    expect(queryCalls.map((c) => c.url)).toEqual([
+      'https://api.notion.com/v1/databases/db1/query',
+    ]);
+    expect(calls.filter((c) => c.url.includes('/blocks/'))).toHaveLength(3);
+  });
+
+  it('resumes mid-sweep from { phase: dbsweep, dbQueue, dbCursor } at that row cursor, skipping pages and discovery entirely', async () => {
+    const row3 = page('row3', T6, { parent: { type: 'database_id' } });
+    const { fetchFn, calls } = scriptedFetch([
+      jsonResponse(200, { results: [row3], has_more: false, next_cursor: null }),
+      emptyBlocks(), // row3 blocks
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const session = makeSession({ password: 'secret_x' });
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, {
+      lastEditedTime: T2,
+      phase: 'dbsweep',
+      dbQueue: ['db7'],
+      dbCursor: 'row-cursor-3',
+    })) {
+      batches.push(b);
+    }
+
+    expect(calls[0].url).toBe('https://api.notion.com/v1/databases/db7/query');
+    expect((calls[0].body as { start_cursor?: string }).start_cursor).toBe('row-cursor-3');
+    expect(batches).toHaveLength(2);
+    expect(batches[0].items.map((i) => i.page.id)).toEqual(['row3']);
+    expect(batches[1]).toEqual({ phase: 'live', items: [], cursor: { lastEditedTime: T6 } });
+  });
+
+  it('skips an unreadable page with a warning and keeps walking (401 would propagate)', async () => {
+    const p1 = page('p1', T1);
+    const p2 = page('p2', T3);
+    const { fetchFn } = scriptedFetch([
+      jsonResponse(200, { results: [p1, p2], has_more: false, next_cursor: null }),
+      jsonResponse(404, { code: 'object_not_found', message: 'gone' }), // p1 blocks fail
+      emptyBlocks(), // p2 blocks
+      jsonResponse(200, { results: [], has_more: false, next_cursor: null }), // db discovery
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const warnings: string[] = [];
+    const session: Session = {
+      ...makeSession({ password: 'secret_x' }),
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    };
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, null)) batches.push(b);
+
+    expect(batches[0].items.map((i) => i.page.id)).toEqual(['p2']);
+    expect(warnings.some((w) => w.includes('p1'))).toBe(true);
+    // the failed page never advanced the high-water mark; p2 did
+    expect(batches[0].cursor.lastEditedTime).toBe(T3);
+  });
+
+  it('propagates a 401 from a block fetch instead of skipping (every later call would fail identically)', async () => {
+    const p1 = page('p1', T1);
+    const { fetchFn } = scriptedFetch([
+      jsonResponse(200, { results: [p1], has_more: false, next_cursor: null }),
+      jsonResponse(401, { code: 'unauthorized', message: 'API token is invalid.' }),
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const session = makeSession({ password: 'secret_x' });
+
+    await expect(
+      (async () => {
+        // eslint-disable-next-line no-unused-vars
+        for await (const _b of source.pull(session, null)) {
+          // drain
+        }
+      })(),
+    ).rejects.toThrow(/unauthorized/);
+  });
+
+  it('skips a whole database whose query fails (deleted/unshared), sweeping the rest', async () => {
+    const row9 = page('row9', T5, { parent: { type: 'database_id' } });
+    const { fetchFn } = scriptedFetch([
+      jsonResponse(404, { code: 'object_not_found', message: 'db gone' }), // db1 query fails
+      jsonResponse(200, { results: [row9], has_more: false, next_cursor: null }), // db2 rows
+      emptyBlocks(), // row9 blocks
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const warnings: string[] = [];
+    const session: Session = {
+      ...makeSession({ password: 'secret_x' }),
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    };
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, {
+      lastEditedTime: T2,
+      phase: 'dbsweep',
+      dbQueue: ['db1', 'db2'],
+    })) {
+      batches.push(b);
+    }
+
+    expect(warnings.some((w) => w.includes('db1'))).toBe(true);
+    // db1's failure batch pops it from the queue so a crash never re-walks it
+    expect(batches[0]).toEqual({
+      phase: 'backfill',
+      items: [],
+      cursor: { lastEditedTime: T2, phase: 'dbsweep', dbQueue: ['db2'] },
+    });
+    expect(batches[1].items.map((i) => i.page.id)).toEqual(['row9']);
+    expect(batches[2]).toEqual({ phase: 'live', items: [], cursor: { lastEditedTime: T5 } });
   });
 });
 
@@ -357,6 +535,35 @@ describe('pull — delta', () => {
     expect(calls.filter((c) => c.url.endsWith('/search'))).toHaveLength(1);
   });
 
+  it('skips a page whose block fetch fails with a warning and still ingests the rest of the slice (v1 parity)', async () => {
+    const L0 = '2024-07-01T00:10:00.000Z'; // floor = 00:09:00.000Z
+    const newer = page('newer', '2024-07-01T00:20:00.000Z');
+    const broken = page('broken', '2024-07-01T00:15:00.000Z');
+    const tail = page('tail', '2024-07-01T00:08:00.000Z');
+
+    const { fetchFn } = scriptedFetch([
+      jsonResponse(200, { results: [newer, broken, tail], has_more: false, next_cursor: null }),
+      jsonResponse(404, { code: 'object_not_found', message: 'gone' }), // broken blocks (oldest-first)
+      emptyBlocks(), // newer blocks
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const warnings: string[] = [];
+    const session: Session = {
+      ...makeSession({ password: 'secret_x' }),
+      log: (level, msg) => {
+        if (level === 'warn') warnings.push(msg);
+      },
+    };
+
+    const batches: Array<Batch<NotionCursor, NotionItem>> = [];
+    for await (const b of source.pull(session, { lastEditedTime: L0 })) batches.push(b);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].items.map((i) => i.page.id)).toEqual(['newer']);
+    expect(warnings.some((w) => w.includes('broken'))).toBe(true);
+    expect(batches[0].cursor).toEqual({ lastEditedTime: newer.last_edited_time });
+  });
+
   it('slices >20 collected pages into oldest-first batches whose cursors only ever cover what that slice (and earlier ones) fully ingested, folding the scan ceiling only into the final slice', async () => {
     const L0 = '2024-05-01T01:00:00.000Z'; // floor = 2024-05-01T00:59:00.000Z
     const skippedNewest = page('skippedNewest', '2024-05-01T02:00:00.000Z', { archived: true });
@@ -425,12 +632,21 @@ describe('pull — missing credentials', () => {
 });
 
 describe('reconcile', () => {
-  it('yields externalId refs per search page, skipping archived/in_trash', async () => {
+  it('yields externalId refs from the page search AND every database\'s rows, skipping archived/in_trash', async () => {
     const a = page('ra', '2024-01-01T00:00:00.000Z');
     const b = page('rb', '2024-01-01T00:00:00.000Z', { archived: true });
     const c = page('rc', '2024-01-01T00:00:00.000Z', { in_trash: true });
-    const { fetchFn } = scriptedFetch([
+    const row = page('row1', '2024-01-01T00:00:00.000Z', { parent: { type: 'database_id' } });
+    const { fetchFn, calls } = scriptedFetch([
       jsonResponse(200, { results: [a, b, c], has_more: false, next_cursor: null }),
+      // database discovery
+      jsonResponse(200, {
+        results: [page('db1', '2024-01-01T00:00:00.000Z', { object: 'database' })],
+        has_more: false,
+        next_cursor: null,
+      }),
+      // db1 rows: ra again (dupe — harmless in a live-set) + a search-missed row
+      jsonResponse(200, { results: [a, row], has_more: false, next_cursor: null }),
     ]);
     const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession({ password: 'secret_x' });
@@ -438,7 +654,39 @@ describe('reconcile', () => {
     const refs: ExternalRef[] = [];
     for await (const batch of source.reconcile!(session)) refs.push(...batch);
 
-    expect(refs).toEqual([{ externalId: 'ra', type: 'notion.page' }]);
+    expect(refs).toEqual([
+      { externalId: 'ra', type: 'notion.page' },
+      { externalId: 'ra', type: 'notion.page' },
+      { externalId: 'row1', type: 'notion.page' },
+    ]);
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://api.notion.com/v1/search',
+      'https://api.notion.com/v1/search',
+      'https://api.notion.com/v1/databases/db1/query',
+    ]);
+  });
+
+  it('propagates a database query failure — a partial listing that looks complete would archive that database\'s rows', async () => {
+    const { fetchFn } = scriptedFetch([
+      jsonResponse(200, { results: [], has_more: false, next_cursor: null }),
+      jsonResponse(200, {
+        results: [page('db1', '2024-01-01T00:00:00.000Z', { object: 'database' })],
+        has_more: false,
+        next_cursor: null,
+      }),
+      jsonResponse(404, { code: 'object_not_found', message: 'db gone' }),
+    ]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const session = makeSession({ password: 'secret_x' });
+
+    await expect(
+      (async () => {
+        // eslint-disable-next-line no-unused-vars
+        for await (const _batch of source.reconcile!(session)) {
+          // drain
+        }
+      })(),
+    ).rejects.toThrow(/object_not_found/);
   });
 });
 
