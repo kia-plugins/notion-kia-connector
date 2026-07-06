@@ -1,9 +1,16 @@
 {
   "id": "kia.notion",
   "name": "Notion",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "engine": "^1.0.0",
   "entry": "dist/index.js",
-  "caps": ["net"],
-  "contributes": { "sources": ["notion"] }
+  "caps": [
+    "net"
+  ],
+  "contributes": {
+    "sources": [
+      "notion"
+    ]
+  },
+  "icon": "icon.png"
 }
