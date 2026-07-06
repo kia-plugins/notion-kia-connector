@@ -326,8 +326,27 @@ export function createNotionSource(
       const answers = await auth.prompt({
         type: 'object',
         required: ['password'],
+        description:
+          'Notion indexing uses an internal integration you create in your workspace — read-only, no OAuth app involved.',
+        'x-steps': [
+          {
+            title: 'Create an integration',
+            body: 'New integration → pick your workspace → copy the Internal Integration Secret.',
+            link: 'https://www.notion.so/my-integrations',
+          },
+          {
+            title: 'Share pages with it',
+            body: 'In Notion, open each page or database to index → ••• → Connections → add your integration.',
+          },
+        ],
         properties: {
-          password: { type: 'string', title: 'Internal Integration Secret', format: 'password' },
+          password: {
+            type: 'string',
+            title: 'Internal Integration Secret',
+            format: 'password',
+            examples: ['ntn_…'],
+            description: 'Starts with ntn_ (older integrations: secret_).',
+          },
         },
       });
       const token = typeof answers.password === 'string' ? answers.password.trim() : '';

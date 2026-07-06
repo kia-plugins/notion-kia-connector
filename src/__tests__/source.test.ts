@@ -133,6 +133,22 @@ describe('connect', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('includes guided setup steps and a placeholder example in the prompt schema', async () => {
+    const { fetchFn } = scriptedFetch([]);
+    const source = createNotionSource(makeHost(fetchFn), instantClock);
+    const { auth, getSchema } = makeAuth({ password: 'not-a-real-token' });
+
+    await expect(source.connect(auth)).rejects.toThrow(/does not look like a Notion/);
+
+    const promptSchema = getSchema() as {
+      'x-steps': { title: string; link?: string }[];
+      properties: { password: { examples: string[] } };
+    };
+    expect(promptSchema['x-steps']).toHaveLength(2);
+    expect(promptSchema['x-steps'][0].link).toBe('https://www.notion.so/my-integrations');
+    expect(promptSchema.properties.password.examples[0]).toBe('ntn_…');
+  });
+
   it('accepts a valid-looking token, hits /users/me, and returns the workspace name identifier', async () => {
     const { fetchFn, calls } = scriptedFetch([
       jsonResponse(200, { bot: { workspace_name: 'Acme Corp' } }),
