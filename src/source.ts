@@ -8,9 +8,9 @@
  * main:src/delta.ts`) even though spec §6 says "ascending" — that wording
  * governs backfill only; Task 14 updates the spec text.
  */
-import type { AuthChannel, Batch, HostFor, Session, Source } from './kiagent-contracts';
+import type { AuthChannel, Batch, HostFor, Session, Source } from '@kiagent/connector-sdk';
+import { SourceAuthError } from '@kiagent/connector-sdk';
 import { NotionApiError, NotionClient, type NotionClientDeps } from './client';
-import { SourceAuthError } from './kiagent-source-errors';
 import type { NotionSearchResult } from './notion-types';
 import { buildMarkdown, fetchBlockTree, pageTitle } from './pages';
 

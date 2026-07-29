@@ -13,7 +13,7 @@
  */
 import { createNotionSource, type NotionCursor, type NotionItem } from '../source';
 import { NotionApiError, type NetFetch } from '../client';
-import { SourceAuthError } from '../kiagent-source-errors';
+import { SourceAuthError } from '@kiagent/connector-sdk';
 import type { NotionSearchResult } from '../notion-types';
 import type {
   Account,
@@ -23,7 +23,7 @@ import type {
   ExternalRef,
   HostFor,
   Session,
-} from '../kiagent-contracts';
+} from '@kiagent/connector-sdk';
 
 function jsonResponse(status: number, json: unknown, headers: Record<string, string> = {}) {
   return {
@@ -90,6 +90,12 @@ function makeAuth(answers: Record<string, unknown>): {
       return answers;
     },
     status: () => {},
+    // Notion's password-auth connect() never reaches for the folder picker;
+    // this stub only exists to satisfy AuthChannel's shape (canonical
+    // contracts vintage added this required member — see task-7-report.md).
+    pickFolders: async () => {
+      throw new Error('not scripted: pickFolders');
+    },
   };
   return { auth, getSchema: () => schema };
 }
