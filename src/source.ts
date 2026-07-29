@@ -10,6 +10,7 @@
  */
 import type { AuthChannel, Batch, HostFor, Session, Source } from './kiagent-contracts';
 import { NotionApiError, NotionClient, type NotionClientDeps } from './client';
+import { SourceAuthError } from './kiagent-source-errors';
 import type { NotionSearchResult } from './notion-types';
 import { buildMarkdown, fetchBlockTree, pageTitle } from './pages';
 
@@ -49,7 +50,8 @@ export interface NotionItem {
 async function requireToken(session: Session): Promise<string> {
   const creds = await session.credentials();
   const token = creds?.password;
-  if (!token) throw new Error('no Notion credentials — reconnect the account');
+  // No stored credential — retrying can't conjure one; only reauth fixes it.
+  if (!token) throw new SourceAuthError('no Notion credentials — reconnect the account');
   return token;
 }
 

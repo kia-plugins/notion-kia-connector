@@ -48,6 +48,11 @@ interface NotionPageEnvelope<T> {
 
 /** Carries Notion's error code string and the HTTP status for callers to branch on. */
 export class NotionApiError extends Error {
+  /** Source-taxonomy code the engine keys on: a live 401 (revoked/rotated
+   *  integration secret) must commit needsReauth, not burn the transient
+   *  retry budget. Mirrors source.ts's isAuthError predicate. */
+  readonly code?: 'auth';
+
   constructor(
     public notionCode: string,
     public httpStatus: number,
@@ -55,6 +60,7 @@ export class NotionApiError extends Error {
   ) {
     super(`notion ${notionCode}: ${message}`);
     this.name = 'NotionApiError';
+    if (httpStatus === 401) this.code = 'auth';
   }
 }
 

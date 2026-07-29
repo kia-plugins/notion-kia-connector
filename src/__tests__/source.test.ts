@@ -13,6 +13,7 @@
  */
 import { createNotionSource, type NotionCursor, type NotionItem } from '../source';
 import { NotionApiError, type NetFetch } from '../client';
+import { SourceAuthError } from '../kiagent-source-errors';
 import type { NotionSearchResult } from '../notion-types';
 import type {
   Account,
@@ -630,19 +631,27 @@ describe('pull — delta', () => {
 });
 
 describe('pull — missing credentials', () => {
-  it('throws telling the user to reconnect the account, before any fetch', async () => {
+  it('throws a SourceAuthError (code "auth") telling the user to reconnect the account, before any fetch', async () => {
     const { fetchFn, calls } = scriptedFetch([]);
     const source = createNotionSource(makeHost(fetchFn), instantClock);
     const session = makeSession(null);
 
-    await expect(
-      (async () => {
-        // eslint-disable-next-line no-unused-vars
-        for await (const _batch of source.pull(session, null)) {
-          // drain
-        }
-      })(),
-    ).rejects.toThrow(/reconnect the account/);
+    let caught: unknown;
+    try {
+      // eslint-disable-next-line no-unused-vars
+      for await (const _batch of source.pull(session, null)) {
+        // drain
+      }
+    } catch (e) {
+      caught = e;
+    }
+
+    // Un-recoverable by retrying — the engine must land on needsReauth, not
+    // burn the transient-retry budget (source-errors.ts taxonomy).
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).toBeInstanceOf(SourceAuthError);
+    expect((caught as SourceAuthError).code).toBe('auth');
+    expect((caught as Error).message).toBe('no Notion credentials — reconnect the account');
     expect(calls).toHaveLength(0);
   });
 });

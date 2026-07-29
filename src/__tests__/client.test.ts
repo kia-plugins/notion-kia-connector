@@ -169,6 +169,10 @@ describe('NotionClient', () => {
     expect(error).toBeInstanceOf(NotionApiError);
     expect((error as NotionApiError).httpStatus).toBe(401);
     expect((error as NotionApiError).notionCode).toBe('unauthorized');
+    // Source-taxonomy contract: the engine keys on `code` to commit
+    // needsReauth — 401 must carry it, other statuses must not.
+    expect((error as NotionApiError).code).toBe('auth');
+    expect(new NotionApiError('rate_limited', 429, 'slow down').code).toBeUndefined();
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
